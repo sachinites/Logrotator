@@ -10,6 +10,7 @@
 #define LOG_FILE_1 "var/log/ipstrc.log"
 #define LOG_FILE_2 "var/log/pdtrc.log"
 #define LOG_FILE_3 "var/log/ipmgr.log"
+#define LOG_FILE_4 "var/log/inttrc.log"
 #define MAX_LOG_SIZE 10240  // 10KB in bytes
 
 // Log level types
@@ -18,6 +19,19 @@ const int num_log_levels = 4;
 
 // Sample log messages for each service
 const char *ipstrc_messages[] = {
+    "Connection established from 192.168.1.100",
+    "Packet received: size=%d bytes",
+    "Connection timeout detected",
+    "Routing table updated",
+    "NAT translation added",
+    "Firewall rule applied",
+    "TCP handshake completed",
+    "UDP datagram processed",
+    "Network interface status changed",
+    "IP address conflict detected"
+};
+
+const char *inttrc_messages[] = {
     "Connection established from 192.168.1.100",
     "Packet received: size=%d bytes",
     "Connection timeout detected",
@@ -55,6 +69,7 @@ const char *ipmgr_messages[] = {
     "IP address released",
     "Network range expanded"
 };
+
 
 // Get current timestamp in ISO 8601 format
 void get_timestamp(char *buffer, size_t size) {
@@ -117,6 +132,23 @@ void generate_ipmgr_log(char *buffer, size_t size) {
     strncat(buffer, "\n", size - strlen(buffer) - 1);
 }
 
+// Generate a random log message for ipmgr
+void generate_inttrc_log(char *buffer, size_t size) {
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    
+    int msg_idx = rand() % 10;
+    int level_idx = rand() % num_log_levels;
+    int random_val = rand() % 100;
+    
+    snprintf(buffer, size, "[%s] [%s] ", timestamp, log_levels[level_idx]);
+    
+    char msg[256];
+    snprintf(msg, sizeof(msg), inttrc_messages[msg_idx], random_val);
+    strncat(buffer, msg, size - strlen(buffer) - 1);
+    strncat(buffer, "\n", size - strlen(buffer) - 1);
+}
+
 // Get file size in bytes
 long get_file_size(const char *filename) {
     struct stat st;
@@ -126,65 +158,29 @@ long get_file_size(const char *filename) {
     return 0;  // File doesn't exist or error
 }
 
-// Rename log file to .bak file
-int rename_to_bak(const char *filename) {
-    char bak_filename[512];
-    
-    // Create .bak filename by replacing .log with .bak
-    strncpy(bak_filename, filename, sizeof(bak_filename) - 1);
-    bak_filename[sizeof(bak_filename) - 1] = '\0';
-    
-    // Find and replace .log with .bak
-    char *log_ext = strstr(bak_filename, ".log");
-    if (log_ext != NULL) {
-        strcpy(log_ext, ".bak");
-    } else {
-        // If no .log extension, just append .bak
-        strncat(bak_filename, ".bak", sizeof(bak_filename) - strlen(bak_filename) - 1);
-    }
-    
-    // Remove old .bak file if it exists
-    if (access(bak_filename, F_OK) == 0) {
-        if (remove(bak_filename) != 0) {
-            fprintf(stderr, "Warning: Could not remove old %s: %s\n", 
-                    bak_filename, strerror(errno));
-        }
-    }
-    
-    // Rename current log file to .bak
-    if (rename(filename, bak_filename) == 0) {
-        printf("\n[ROTATION] Renamed %s to %s\n", filename, bak_filename);
-        return 0;
-    } else {
-        fprintf(stderr, "Error renaming %s to %s: %s\n", filename, bak_filename, strerror(errno));
-        return -1;
-    }
-}
-
 // Write log to file, rename to .bak if size exceeds limit
-int write_log(const char *filename, const char *log_message) {
-    // Check file size before writing
+int write_log(FILE **fp, const char *filename, const char *log_message) {
+    static long old_size = 0;
     long current_size = get_file_size(filename);
-n    
-    // If file exceeds max size, rename to .bak and start fresh
-    if (current_size >= MAX_LOG_SIZE) {
-        printf("\n[SIZE LIMIT] File %s reached %ld bytes\n", filename, current_size);
-        rename_to_bak(filename);
+
+    if (current_size - old_size >= MAX_LOG_SIZE) {
+        fclose(*fp);
+
+        // make a new unique .bak each time
+        char bak_name[256];
+        snprintf(bak_name, sizeof(bak_name), "%s.%ld.bak", filename, time(NULL));
+
+        rename(filename, bak_name);
+
+        *fp = fopen(filename, "a"); // start new log
+        old_size = 0;
     }
-    
-    // Open file in append mode (will create new file if it was renamed)
-    FILE *fp = fopen(filename, "a");
-    if (fp == NULL) {
-        fprintf(stderr, "Error opening %s: %s\n", filename, strerror(errno));
-        return -1;
-    }
-    
-    fprintf(fp, "%s", log_message);
-    fflush(fp);
-    fclose(fp);
-    
+
+    fprintf(*fp, "%s", log_message);
+    fflush(*fp);
     return 0;
 }
+
 
 int main(int argc, char *argv[]) {
     char log_buffer[512];
@@ -198,39 +194,71 @@ int main(int argc, char *argv[]) {
     printf("  - %s\n", LOG_FILE_1);
     printf("  - %s\n", LOG_FILE_2);
     printf("  - %s\n", LOG_FILE_3);
+    printf("  - %s\n", LOG_FILE_4);
     printf("Rate: ~10 lines per second\n");
     printf("Max log size: %d bytes (rename to .bak when exceeded)\n", MAX_LOG_SIZE);
     printf("Press Ctrl+C to stop\n\n");
-    
+    FILE *ipstr_fp = fopen(LOG_FILE_1, "a");
+    if (ipstr_fp == NULL)
+    {
+        fprintf(stderr, "Error opening %s: %s\n", LOG_FILE_1, strerror(errno));
+        return -1;
+    }
+    FILE *pdtr_fp = fopen(LOG_FILE_2, "a");
+    if (pdtr_fp == NULL)
+    {
+        fprintf(stderr, "Error opening %s: %s\n", LOG_FILE_2, strerror(errno));
+        return -1;
+    }
+    FILE *ipmgr_fp = fopen(LOG_FILE_3, "a");
+    if (ipmgr_fp == NULL)
+    {
+        fprintf(stderr, "Error opening %s: %s\n", LOG_FILE_3, strerror(errno));
+        return -1;
+    }
+    FILE *inttr_fp = fopen(LOG_FILE_4, "a");
+    if (inttr_fp == NULL)
+    {
+        fprintf(stderr, "Error opening %s: %s\n", LOG_FILE_4, strerror(errno));
+        return -1;
+    }
+
     // Main loop - generate logs continuously
     while (1) {
         // Decide which log file to write to (round-robin with some randomness)
-        int target = log_counter % 3;
+        int target = log_counter % 4;
         
         // Add some randomness to distribution
         if (rand() % 100 < 20) {
-            target = rand() % 3;
+            target = rand() % 4;
         }
-        
+
         switch (target) {
             case 0:
                 generate_ipstrc_log(log_buffer, sizeof(log_buffer));
-                if (write_log(LOG_FILE_1, log_buffer) == 0) {
+
+                if (write_log(&ipstr_fp, LOG_FILE_1, log_buffer) == 0) {
                     printf("[%d] ipstrc: %s", log_counter + 1, log_buffer);
                 }
                 break;
             
             case 1:
                 generate_pdtrc_log(log_buffer, sizeof(log_buffer));
-                if (write_log(LOG_FILE_2, log_buffer) == 0) {
+                if (write_log(&pdtr_fp, LOG_FILE_2, log_buffer) == 0) {
                     printf("[%d] pdtrc: %s", log_counter + 1, log_buffer);
                 }
                 break;
             
             case 2:
                 generate_ipmgr_log(log_buffer, sizeof(log_buffer));
-                if (write_log(LOG_FILE_3, log_buffer) == 0) {
+                if (write_log(&ipmgr_fp, LOG_FILE_3, log_buffer) == 0) {
                     printf("[%d] ipmgr: %s", log_counter + 1, log_buffer);
+                }
+                break;            
+            case 3:
+                generate_inttrc_log(log_buffer, sizeof(log_buffer));
+                if (write_log(&inttr_fp, LOG_FILE_4, log_buffer) == 0) {
+                    printf("[%d] inttrc: %s", log_counter + 1, log_buffer);
                 }
                 break;
         }

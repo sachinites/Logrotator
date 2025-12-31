@@ -1,48 +1,176 @@
+/*******************************************************************************
+ * File: monitor.c
+ * 
+ * Description:
+ *   Log rotation and compression system for managing application log files.
+ *   Uses inotify to monitor .bak file creation, automatically rotates numbered
+ *   log files, and compresses old logs into timestamped tar.gz archives.
+ *
+ * Features:
+ *   - Automatic detection of .bak file creation using inotify
+ *   - Numbered log file rotation (log.0, log.1, ..., log.N)
+ *   - Asynchronous compression using dedicated zipper thread
+ *   - Zero-copy file concatenation using sendfile()
+ *   - Thread-safe operation with semaphores and atomic variables
+ *
+ * Managed Files:
+ *   - ipstrc.bak  -> IP Stack Trace logs
+ *   - pdtrc.bak   -> Protocol Data Trace logs
+ *   - ipmgr.bak   -> IP Manager logs
+ *   - inttrc.bak  -> Internal Trace logs
+ *
+ * Author: [Your Name]
+ * Date: [Date]
+ ******************************************************************************/
+
 #define _POSIX_C_SOURCE 200809L
+
+/* Standard Library Headers */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/inotify.h>
-#include <limits.h>
+#include <stdbool.h>
 #include <errno.h>
+#include <limits.h>
+#include <time.h>
+
+/* System Headers */
+#include <sys/inotify.h>
+#include <sys/sendfile.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+/* Threading Headers */
 #include <pthread.h>
+#include <semaphore.h>
+#include <stdatomic.h>
 
-#define EVENT_SIZE (sizeof(struct inotify_event))
-#define MAX_FILENAME 255
-#define BUF_LEN (1024 * (EVENT_SIZE + MAX_FILENAME + 1))
+/* Disable all printf/fprintf and perrors 
+    for production build */
+#define printf(...) do { } while (0)
+#define fprintf(...) do { } while (0)
+#define perror(...) do { } while (0)
 
-// Default values (can be overridden by command-line args)
-#define DEFAULT_MAX_FILES 3
-#define DEFAULT_WATCH_DIR "var/log/"
-#define DEFAULT_NUM_TARGET_FILES 4
+/*******************************************************************************
+ *                          CONFIGURATION DEFINES
+ ******************************************************************************/
 
-// Global configuration
-int MAX_FILES = DEFAULT_MAX_FILES;
-const char *watch_dir = DEFAULT_WATCH_DIR;
-int NUM_TARGET_FILES = DEFAULT_NUM_TARGET_FILES;
-char **target_files = NULL;
+/* Inotify buffer configuration */
+#define EVENT_SIZE              (sizeof(struct inotify_event))
+#define MAX_FILENAME            64
+#define BUF_LEN                 (1024 * (EVENT_SIZE + MAX_FILENAME + 1))
 
-void zip_all_files(char *name) {
+/* File path configuration */
+#define FILE_ABS_PATH_NAME_LEN  256
+#define DEFAULT_WATCH_DIR       "var/log/"
 
-    if(!name) return;
+/* Log rotation configuration */
+#define DEFAULT_MAX_FILES       5  /* Number of rotated log files to keep */
+#define DEFAULT_NUM_TARGET_FILES 4 /* Number of target log file types */
 
-    char base[512], dir[512], fname[256];
+/*******************************************************************************
+ *                          GLOBAL VARIABLES
+ ******************************************************************************/
+
+/* 
+ * Target log files to monitor (without .bak extension)
+ * These are the base names that will be matched in inotify events
+ */
+const char target_files[][MAX_FILENAME] = {
+    "ipstrc",   /* IP Stack Trace logs */
+    "pdtrc",    /* Protocol Data Trace logs */
+    "ipmgr",    /* IP Manager logs */
+    "inttrc"    /* Internal Trace logs */
+};
+
+/*
+ * Thread Synchronization Primitives
+ * ----------------------------------
+ * zipper_thread_sync: Zero semaphore controlling access to zipper thread.
+ *                     Posted when files are ready to be compressed.
+ *                     
+ * wait_for_thread_init: Zero semaphore ensuring threads are initialized
+ *                       before main thread proceeds.
+ */
+static sem_t zipper_thread_sync;
+static sem_t wait_for_thread_init;
+
+/*
+ * Atomic flag indicating compression is in progress.
+ * When true, the log rotator will concatenate new .bak files to log.0
+ * instead of rotating, to avoid interfering with compression.
+ */
+static atomic_bool zip_in_progress = false;
+
+/*
+ * Filename passed to zipper thread (e.g., "var/log/ipmgr.log.5")
+ * Set by file_rotate() when the highest numbered log file is created.
+ */
+static char terminal_fname[MAX_FILENAME];
+
+/* Thread handles */
+static pthread_t zipper_thread;
+static pthread_t log_rotator_thread;
+
+/* Inotify file descriptors */
+static int inotify_fd;  /* inotify instance */
+static int watch_fd;    /* watch descriptor for monitored directory */
+
+/*******************************************************************************
+ *                      FILE COMPRESSION FUNCTIONS
+ ******************************************************************************/
+
+/**
+ * compress_all_log_files()
+ * 
+ * Purpose:
+ *   Compresses all numbered log files (log.1 to log.N) into a single
+ *   timestamped tar.gz archive, then deletes the original files.
+ *
+ * Input:
+ *   Reads from global variable 'terminal_fname' which contains the path
+ *   to the highest numbered log file (e.g., "var/log/ipmgr.log.5")
+ *
+ * Process:
+ *   1. Parse filename to extract base name and maximum index
+ *   2. Create timestamped archive name
+ *   3. Build tar command to compress all numbered files
+ *   4. Execute tar command
+ *   5. Delete original files on success
+ *
+ * Example:
+ *   Input:  terminal_fname = "var/log/ipmgr.log.5"
+ *   Output: var/log/ipmgr_2025-12-31_14-30-45.tar.gz
+ *           (contains ipmgr.log.1, ipmgr.log.2, ..., ipmgr.log.5)
+ */
+static void 
+compress_all_log_files(void)
+{
     int max_index = 0;
+    char base[MAX_FILENAME + 32];   /* Base path without number */
+    char dir[MAX_FILENAME + 32];    /* Directory path */
+    char fname[MAX_FILENAME];       /* Filename without path */
+    char *name = terminal_fname;
 
-    /* Parse .number at end */
+    printf("%s() called....\n", __FUNCTION__);
+
+    /*
+     * Parse the file number from the end of the filename
+     * Example: "var/log/ipmgr.log.5" -> max_index = 5
+     */
     char *last_dot = strrchr(name, '.');
-    if (!last_dot || sscanf(last_dot+1, "%d", &max_index) != 1) {
+    if (!last_dot || sscanf(last_dot + 1, "%d", &max_index) != 1) {
         fprintf(stderr, "ERROR: Invalid file format: %s (expected base.number)\n", name);
         return;
     }
 
-    /* Extract base "path/filename" without number */
+    /* Extract base path without the number (e.g., "var/log/ipmgr.log") */
     size_t len = last_dot - name;
     strncpy(base, name, len);
     base[len] = '\0';
 
-    /* Split path and filename */
+    /* Split into directory and filename components */
     char *slash = strrchr(base, '/');
     if (slash) {
         size_t dlen = slash - base;
@@ -54,182 +182,458 @@ void zip_all_files(char *name) {
         strcpy(fname, base);
     }
 
-    /* Timestamp for archive */
-    char archive[600];
+    /*
+     * Generate timestamp for archive name
+     * Format: YYYY-MM-DD_HH-MM-SS
+     */
+    char archive[256];
+    char timestamp[64];
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
-    char timestamp[64];
+    
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", tm);
-
     snprintf(archive, sizeof(archive), "%s/%s_%s.tar.gz", dir, fname, timestamp);
 
-    /* Build tar command: only filenames inside archive */
+    /*
+     * Build tar command
+     * -c: create archive
+     * -z: compress with gzip
+     * -f: output filename
+     * -C: change to directory (so archive contains only filenames, not full paths)
+     */
     char cmd[2048];
+    char file_only[128];
+    char fullpath[256];
+    bool do_archive = false;
+
     snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\"", archive, dir);
 
-    printf("\n--- Adding files ---\n");
+    /* Iterate through all numbered files and add them to the tar command */
+    printf("\n--- Collecting Files for Archive ---\n");
     for (int i = 1; i <= max_index; i++) {
-        char file_only[256], fullpath[600];
         snprintf(file_only, sizeof(file_only), "%s.%d", fname, i);
         snprintf(fullpath, sizeof(fullpath), "%s/%s.%d", dir, fname, i);
 
         if (access(fullpath, F_OK) == 0) {
-            printf("✔ Found: %s\n", fullpath);
+            printf("   Found: %s\n", fullpath);
             strcat(cmd, " ");
             strcat(cmd, file_only);
+            do_archive = true;
         } else {
-            printf("✘ Missing: %s\n", fullpath);
+            printf("  [✗] Missing: %s\n", fullpath);
         }
     }
 
-    printf("\n--- Running TAR ---\n%s\n\n", cmd);
-
-    if(system(cmd) != 0) {
-        perror("tar failed");
+    /* Exit if no files found */
+    if (!do_archive) {
+        printf("Nothing to archive.\n");
         return;
     }
 
-    /* Remove originals AFTER successful archive */
-    printf("--- Removing originals ---\n");
-    for (int i = 1; i <= max_index; i++) {
-        char rm[600];
-        snprintf(rm, sizeof(rm), "%s/%s.%d", dir, fname, i);
-        if(remove(rm) == 0)
-            printf("✔ Deleted: %s\n", rm);
-        else
-            perror(rm);
+    /* Execute tar command */
+    printf("\n--- Executing TAR Command ---\n%s\n\n", cmd);
+    if (system(cmd) != 0) {
+        perror("ERROR: tar command failed");
+        return;
     }
 
-    printf("\n🎯 DONE: %s\n\n", archive);
+    /* Remove original files after successful archive creation */
+    printf("--- Cleaning Up Original Files ---\n");
+    for (int i = 1; i <= max_index; i++) {
+        char rm[256];
+        snprintf(rm, sizeof(rm), "%s/%s.%d", dir, fname, i);
+        
+        if (remove(rm) == 0) {
+            printf("   Deleted: %s\n", rm);
+        } else {
+            perror(rm);
+        }
+    }
+
+    printf("\n[SUCCESS] Archive created: %s\n\n", archive);
 }
 
-// Function to rotate numbered log files
-void rotate_numbered_files(const char *base_name) {
-    char old_name[512];
-    char new_name[512];
+/**
+ * zip_log_file_thread_fn()
+ * 
+ * Purpose:
+ *   Worker thread that waits for compression requests and processes them.
+ *   Runs in an infinite loop waiting on the zipper_thread_sync semaphore.
+ *
+ * Thread Safety:
+ *   - Uses atomic operations to set/clear zip_in_progress flag
+ *   - Synchronized with log rotator via semaphore
+ *
+ * Cancellation:
+ *   Thread is cancellable at sem_wait() cancellation point
+ */
+static void *
+zip_log_file_thread_fn(void *arg)
+{
+    (void)arg;  /* Unused parameter */
 
-    // Delete the oldest file if it exists
-    snprintf(old_name, sizeof(old_name), "%s.log.%d", base_name, MAX_FILES);
+    /* Configure thread cancellation behavior */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+    /* Signal that thread initialization is complete */
+    sem_post(&wait_for_thread_init);
+
+    /* Main work loop */
+    while (1) {
+        /* Wait for compression request (cancellation point) */
+        sem_wait(&zipper_thread_sync);
+        
+        /* Set atomic flag to indicate compression in progress */
+        atomic_store(&zip_in_progress, true);
+        
+        /* Perform compression */
+        compress_all_log_files();
+        
+        /* Clear atomic flag */
+        atomic_store(&zip_in_progress, false);
+    }
+    
+    return NULL;
+}
+
+/*******************************************************************************
+ *                      LOG ROTATION FUNCTIONS
+ ******************************************************************************/
+
+/**
+ * file_rotate()
+ * 
+ * Purpose:
+ *   Rotates numbered log files by incrementing their numbers.
+ *   When the maximum number of files is reached, signals the zipper thread.
+ *
+ * Process:
+ *   1. Delete oldest file (log.N) if it exists
+ *   2. Rename files backwards: log.N-1 -> log.N, ..., log.0 -> log.1
+ *   3. If log.N-1 was renamed to log.N, signal zipper to compress
+ *
+ * Example:
+ *   Before: log.0, log.1, log.2, log.3, log.4
+ *   After:  log.1, log.2, log.3, log.4, log.5
+ *           (and log.5 gets queued for compression)
+ *
+ * @param base_name  Base path of log file (e.g., "var/log/ipmgr")
+ */
+void 
+file_rotate(const char *base_name)
+{
+    char old_name[FILE_ABS_PATH_NAME_LEN];
+    char new_name[FILE_ABS_PATH_NAME_LEN];
+    bool ready_to_zip = false;
+
+    /* Delete the oldest file if it exists (e.g., ipmgr.log.5) */
+    snprintf(old_name, sizeof(old_name), "%s.log.%d", 
+             base_name, DEFAULT_MAX_FILES);
+
     if (access(old_name, F_OK) == 0) {
         if (remove(old_name) == 0) {
             printf("Deleted oldest file: %s\n", old_name);
         }
     }
 
-    int zip = 0;
-    // Rename files backwards
-    for (int i = MAX_FILES - 1; i >= 0; i--) {
+    /* 
+     * Rotate files backwards (N-1 -> N, N-2 -> N-1, ..., 0 -> 1)
+     * This makes room for the new log.0 file
+     */
+    for (int i = DEFAULT_MAX_FILES - 1; i >= 0; i--) {
         snprintf(old_name, sizeof(old_name), "%s.log.%d", base_name, i);
         snprintf(new_name, sizeof(new_name), "%s.log.%d", base_name, i + 1);
 
         if (access(old_name, F_OK) == 0) {
             if (rename(old_name, new_name) == 0) {
-                printf("Renamed %s to %s\n", old_name, new_name);
-                if (i == MAX_FILES -1) zip = 1;
+                printf("Renamed: %s -> %s\n", old_name, new_name);
+
+                /* 
+                 * If we just created the highest numbered file (log.N),
+                 * mark it for compression
+                 */
+                if (i == DEFAULT_MAX_FILES - 1) {
+                    ready_to_zip = true;
+                }
             } else {
                 fprintf(stderr, "Error renaming %s to %s: %s\n",
                         old_name, new_name, strerror(errno));
             }
         }
     }
-    if (zip){
-        char fname[512];
-        snprintf (fname, sizeof(fname), "%s.log.%d" , base_name, MAX_FILES);
-        zip_all_files(fname);
-        zip = 0;
+
+    /* Signal zipper thread if maximum files reached */
+    if (ready_to_zip) {
+        /* Store filename for zipper thread (e.g., "var/log/ipmgr.log.5") */
+        snprintf(terminal_fname, sizeof(terminal_fname), 
+                 "%s.log.%d", base_name, DEFAULT_MAX_FILES);
+
+        /* Wake up zipper thread to start compression */
+        sem_post(&zipper_thread_sync);
+        ready_to_zip = false;
     }
 }
 
-// Function to handle .bak file creation
-void handle_bak_file(const char *bak_file) {
-    char full_bak_path[512];
+/**
+ * base_file_name_extract()
+ * 
+ * Purpose:
+ *   Extracts the base filename from a .bak file path.
+ *   Modifies the input buffer in-place by truncating at the first dot.
+ *
+ * Example:
+ *   Input:  "var/log/ipmgr.log.1234567890.bak"
+ *   Output: "var/log/ipmgr"
+ *
+ * @param base_name  Buffer containing full path (modified in-place)
+ * @return 0 on success, -1 on failure
+ */
+static int
+base_file_name_extract(char *base_name)
+{
+    /* Find last dot (should be ".bak") */
+    char *last = strrchr(base_name, '.');
+
+    if (last && strcmp(last, ".bak") == 0) {
+        /* Find first dot after the base filename */
+        char *first = strchr(base_name, '.');
+        
+        if (first) {
+            /* Truncate at first dot to get base name */
+            *first = '\0';
+        } else {
+            /* Edge case: filename has .bak but no other dots */
+            *last = '\0';
+        }
+        return 0;
+    }
+
+    return -1;  /* Not a valid .bak file */
+}
+
+/**
+ * handle_bak_file()
+ * 
+ * Purpose:
+ *   Handles the creation of a new .bak file by either:
+ *   - Normal case: Rename .bak to log.0 and rotate existing files
+ *   - Zipper busy: Append .bak content to log.0 (or create log.0 if missing)
+ *
+ * The "zipper busy" case prevents data loss when compression is taking a
+ * long time and new .bak files arrive before rotation can complete.
+ *
+ * @param bak_file  Filename of the .bak file (e.g., "ipmgr.log.1234567890.bak")
+ */
+void 
+handle_bak_file(const char *bak_file)
+{
+    char full_bak_path[FILE_ABS_PATH_NAME_LEN];
     char numbered_file[512];
-    char base_name[512];
+    char base_name[FILE_ABS_PATH_NAME_LEN];
 
-    // Build full path to .bak file
-    snprintf(full_bak_path, sizeof(full_bak_path), "%s%s", watch_dir, bak_file);
-    
-    // Small delay to ensure file system operations are complete
-    usleep(100000);  // 100ms
-    
-    // Verify the .bak file exists before processing
+    /* Build absolute path to .bak file */
+    snprintf(full_bak_path, sizeof(full_bak_path), 
+             "%s%s", DEFAULT_WATCH_DIR, bak_file);
+
+    /* Verify the .bak file exists before processing */
     if (access(full_bak_path, F_OK) != 0) {
-        fprintf(stderr, "File not found: %s\n", full_bak_path);
+        fprintf(stderr, "ERROR: File not found: %s\n", full_bak_path);
         return;
     }
-    
-    // Build base name with full path (remove .bak extension)
+
+    /* Extract base name (e.g., "var/log/ipmgr") */
     snprintf(base_name, sizeof(base_name), "%s", full_bak_path);
-    
-    char *dot = strrchr(base_name, '.');
-    if (dot && strcmp(dot, ".bak") == 0) {
-        *dot = '\0';
-    } else {
-        fprintf(stderr, "Unexpected .bak file format: %s\n", bak_file);
+    if (base_file_name_extract(base_name) < 0) {
+        fprintf(stderr, "ERROR: Invalid .bak filename format\n");
         return;
     }
 
-    printf("Detected .bak file: %s (base: %s)\n", full_bak_path, base_name);
+    printf("\n=== Processing .bak file ===\n");
+    printf("Full path: %s\n", full_bak_path);
+    printf("Base name: %s\n", base_name);
 
-    // Rename .bak to .log.1
+    /*
+     * SPECIAL CASE: Zipper thread is busy compressing files
+     * 
+     * Problem: If we rotate files now, we might interfere with the
+     * compression process or lose data if rotation happens too fast.
+     * 
+     * Solution: Instead of rotating, append the new .bak content to
+     * log.0 (or create log.0 if it doesn't exist). This preserves
+     * all log data without interfering with compression.
+     */
+    if (atomic_load(&zip_in_progress)) {
+        printf("INFO: Compression in progress, using append strategy\n");
+
+        snprintf(numbered_file, sizeof(numbered_file), "%s.log.0", base_name);
+
+        /* Check if log.0 exists */
+        if (access(numbered_file, F_OK) != 0) {
+            /* log.0 doesn't exist - simply rename .bak to log.0 */
+            if (rename(full_bak_path, numbered_file) == 0) {
+                printf("   Created: %s (renamed from .bak)\n", numbered_file);
+            } else {
+                fprintf(stderr, "ERROR: Failed to rename %s to %s: %s\n",
+                        full_bak_path, numbered_file, strerror(errno));
+            }
+        } else {
+            /* 
+             * log.0 exists - append .bak content to it using sendfile()
+             * for efficient zero-copy kernel-space transfer
+             */
+            int src_fd = open(full_bak_path, O_RDONLY);
+            int dest_fd = open(numbered_file, O_WRONLY | O_APPEND);
+
+            if (src_fd >= 0 && dest_fd >= 0) {
+                struct stat stat_buf;
+
+                /* Get source file size */
+                if (fstat(src_fd, &stat_buf) == 0) {
+                    off_t offset = 0;
+                    ssize_t bytes_sent;
+
+                    /* Transfer data using zero-copy sendfile() */
+                    while (offset < stat_buf.st_size) {
+                        bytes_sent = sendfile(dest_fd, src_fd, &offset, 
+                                              stat_buf.st_size - offset);
+                        
+                        if (bytes_sent <= 0) {
+                            /* Handle interrupts and temporary errors */
+                            if (errno == EINTR || errno == EAGAIN) {
+                                continue;
+                            }
+                            fprintf(stderr, "ERROR: sendfile failed: %s\n", 
+                                    strerror(errno));
+                            break;
+                        }
+                    }
+
+                    close(src_fd);
+                    close(dest_fd);
+
+                    /* Remove .bak file after successful append */
+                    if (offset == stat_buf.st_size && remove(full_bak_path) == 0) {
+                        printf("   Appended %ld bytes to %s\n", 
+                               stat_buf.st_size, numbered_file);
+                    } else {
+                        fprintf(stderr, "ERROR: Failed to remove %s: %s\n",
+                                full_bak_path, strerror(errno));
+                    }
+                } else {
+                    close(src_fd);
+                    close(dest_fd);
+                    fprintf(stderr, "ERROR: Failed to get file size: %s\n", 
+                            strerror(errno));
+                }
+            } else {
+                if (src_fd >= 0) close(src_fd);
+                if (dest_fd >= 0) close(dest_fd);
+                fprintf(stderr, "ERROR: Failed to open files: %s\n", 
+                        strerror(errno));
+            }
+        }
+        return;
+    }
+
+    /*
+     * NORMAL CASE: Zipper is not busy
+     * Perform standard rotation: .bak -> log.0, then rotate all files
+     */
     snprintf(numbered_file, sizeof(numbered_file), "%s.log.0", base_name);
 
     if (rename(full_bak_path, numbered_file) == 0) {
-        printf("Renamed %s to %s\n", full_bak_path, numbered_file);
+        printf("   Renamed: %s -> %s\n", full_bak_path, numbered_file);
     } else {
-        fprintf(stderr, "Error renaming %s to %s: %s\n",
+        fprintf(stderr, "ERROR: Rename failed: %s -> %s: %s\n",
                 full_bak_path, numbered_file, strerror(errno));
     }
-    // Rotate existing numbered files
-    rotate_numbered_files(base_name);
+
+    /* Rotate existing numbered files */
+    file_rotate(base_name);
 }
 
-static void *sms_log_rotate(void *arg) {
-    int inotify_fd;
-    int watch_fd;
+/**
+ * log_rotate_thread_fn()
+ * 
+ * Purpose:
+ *   Main worker thread that monitors the log directory for .bak file creation
+ *   using inotify and processes them as they arrive.
+ *
+ * Process:
+ *   1. Initialize inotify and watch the log directory
+ *   2. Enter infinite loop reading inotify events
+ *   3. Filter for .bak files matching target log types
+ *   4. Process each matching .bak file
+ *
+ * Thread Safety:
+ *   Cancellable at read() cancellation point
+ */
+static void *
+log_rotate_thread_fn(void *arg)
+{
+    (void)arg;  /* Unused parameter */
+    
     char buffer[BUF_LEN];
 
-    printf("Log Monitor started. Watching for .bak file creation...\n");
-
-    // Initialize inotify
+    /* Initialize inotify instance */
     inotify_fd = inotify_init();
     if (inotify_fd < 0) {
-        perror("inotify_init");
-        return 0;
+        perror("ERROR: inotify_init failed");
+        return NULL;
     }
 
-    // Watch directory for file creation
-    watch_fd = inotify_add_watch(inotify_fd, watch_dir, IN_CREATE | IN_MOVED_TO);
+    /* 
+     * Add watch for log directory
+     * IN_CREATE: Triggered when files are created
+     * IN_MOVED_TO: Triggered when files are moved into directory
+     */
+    watch_fd = inotify_add_watch(inotify_fd, DEFAULT_WATCH_DIR, 
+                                  IN_CREATE | IN_MOVED_TO);
+
     if (watch_fd < 0) {
-        perror("inotify_add_watch");
+        perror("ERROR: inotify_add_watch failed");
         close(inotify_fd);
-        return 0;
+        return NULL;
     }
 
-    printf("Monitoring directory: %s\n", watch_dir);
+    printf("Monitoring directory: %s\n", DEFAULT_WATCH_DIR);
 
-    // Main event loop
+    /* Configure thread cancellation behavior */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
+
+    /* Signal that thread initialization is complete */
+    sem_post(&wait_for_thread_init);
+
+    /*
+     * Main event processing loop
+     * Blocks on read() waiting for inotify events
+     */
     while (1) {
+        /* Read events from inotify (cancellation point) */
         int length = read(inotify_fd, buffer, BUF_LEN);
+
         if (length < 0) {
-            perror("read");
+            perror("ERROR: inotify read failed");
             break;
         }
 
+        /* Process all events in the buffer */
         int i = 0;
         while (i < length) {
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
 
+            /* Only process events with a filename */
             if (event->len > 0) {
-                printf("DEBUG: Event detected - mask: 0x%x, name: %s\n", event->mask, event->name);
-
+                /* Check if this is a .bak file */
                 if (strstr(event->name, ".bak") != NULL) {
-                    printf("DEBUG: .bak file detected: %s\n", event->name);
+                    printf("\n[inotify] .bak file detected: %s\n", event->name);
 
-                    // Check if it's one of our target files
-                    for (int j = 0; j < NUM_TARGET_FILES; j++) {
-                        if (strcmp(event->name, target_files[j]) == 0) {
-                            printf("DEBUG: Processing target file: %s\n", event->name);
+                    /* Check if it matches one of our target log types */
+                    for (int j = 0; j < DEFAULT_NUM_TARGET_FILES; j++) {
+                        if (strstr(event->name, target_files[j])) {
+                            printf("[inotify] Matches target: %s\n", target_files[j]);
                             handle_bak_file(event->name);
                             break;
                         }
@@ -237,59 +641,162 @@ static void *sms_log_rotate(void *arg) {
                 }
             }
 
+            /* Move to next event */
             i += EVENT_SIZE + event->len;
         }
     }
 
-    // Cleanup
+    /* Cleanup (unreachable code - thread is cancelled) */
+    inotify_rm_watch(inotify_fd, watch_fd);
+    close(inotify_fd);
+    return NULL;
+}
+
+/*******************************************************************************
+ *                      THREAD MANAGEMENT FUNCTIONS
+ ******************************************************************************/
+
+/**
+ * ipmgr_log_rotator_threads_init()
+ * 
+ * Purpose:
+ *   Creates and initializes both worker threads (log rotator and zipper).
+ *   Waits for each thread to signal successful initialization before
+ *   proceeding.
+ *
+ * Thread Attributes:
+ *   - PTHREAD_CREATE_JOINABLE: Threads can be joined for cleanup
+ */
+void 
+ipmgr_log_rotator_threads_init(void)
+{
+    pthread_attr_t attr1, attr2;
+
+    /*
+     * Create Log Rotator Thread
+     * Monitors directory and processes .bak files
+     */
+    pthread_attr_init(&attr1);
+    pthread_attr_setdetachstate(&attr1, PTHREAD_CREATE_JOINABLE);
+
+    if (pthread_create(&log_rotator_thread, &attr1, log_rotate_thread_fn, NULL) != 0) {
+        fprintf(stderr, "ERROR: Failed to create log rotator thread\n");
+        exit(EXIT_FAILURE);
+    }
+    
+    /* Wait for thread to initialize */
+    sem_wait(&wait_for_thread_init);
+    printf(" Log Rotator thread started\n");
+
+    pthread_attr_destroy(&attr1);
+
+    /*
+     * Create Zipper Thread
+     * Compresses old log files into archives
+     */
+    pthread_attr_init(&attr2);
+    pthread_attr_setdetachstate(&attr2, PTHREAD_CREATE_JOINABLE);
+
+    if (pthread_create(&zipper_thread, &attr2, zip_log_file_thread_fn, NULL) != 0) {
+        fprintf(stderr, "ERROR: Failed to create zipper thread\n");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Wait for thread to initialize */
+    sem_wait(&wait_for_thread_init);
+    printf(" Zipper thread started\n");
+
+    pthread_attr_destroy(&attr2);
+}
+
+/**
+ * ipmgr_start_log_rotator_thread()
+ * 
+ * Purpose:
+ *   Public API to start the log rotation system.
+ *   Initializes semaphores and creates worker threads.
+ */
+void 
+ipmgr_start_log_rotator_thread(void)
+{
+    /* Initialize synchronization primitives */
+    sem_init(&zipper_thread_sync, 0, 0);      /* Zero semaphore (starts at 0) */
+    sem_init(&wait_for_thread_init, 0, 0);   /* Zero semaphore for init sync */
+
+    printf("\n========================================\n");
+    printf("  Log Rotation System Starting\n");
+    printf("========================================\n");
+
+    /* Create and start worker threads */
+    ipmgr_log_rotator_threads_init();
+
+    /* Clean up init semaphore (no longer needed) */
+    sem_destroy(&wait_for_thread_init);
+
+    printf("========================================\n");
+    printf("  System Ready - Monitoring for .bak files\n");
+    printf("========================================\n\n");
+}
+
+/**
+ * ipmgr_stop_log_rotator_thread()
+ * 
+ * Purpose:
+ *   Public API to stop the log rotation system.
+ *   Cancels both threads, waits for them to exit, and cleans up resources.
+ */
+void 
+ipmgr_stop_log_rotator_thread(void)
+{
+    printf("\n========================================\n");
+    printf("  Shutting Down Log Rotation System\n");
+    printf("========================================\n");
+
+    /* Cancel and join log rotator thread */
+    pthread_cancel(log_rotator_thread);
+    pthread_join(log_rotator_thread, NULL);
+    printf(" Log rotator thread stopped\n");
+
+    /* Cancel and join zipper thread */
+    pthread_cancel(zipper_thread);
+    pthread_join(zipper_thread, NULL);
+    printf(" Zipper thread stopped\n");
+
+    /* Clean up resources */
+    sem_destroy(&zipper_thread_sync);
     inotify_rm_watch(inotify_fd, watch_fd);
     close(inotify_fd);
 
-    return 0;
+    printf("========================================\n");
+    printf("  System Stopped Successfully\n");
+    printf("========================================\n\n");
 }
 
-void sms_log_rotator_thread_init(void) {
-    pthread_t thread_id;
+/*******************************************************************************
+ *                              MAIN FUNCTION
+ ******************************************************************************/
 
-    if (pthread_create(&thread_id, NULL, sms_log_rotate, NULL) != 0) {
-        perror("pthread_create");
-        exit(1);
-    }
+/**
+ * main()
+ * 
+ * Test driver for the log rotation system.
+ * Starts the system, runs for 60 seconds, then shuts down.
+ */
+int 
+main(int argc, char **argv)
+{
+    (void)argc;  /* Unused parameters */
+    (void)argv;
 
-    printf("Log Monitor thread started.\n");
+    /* Start the log rotation system */
+    ipmgr_start_log_rotator_thread();
+
+    /* Run for 60 seconds (or forever in production) */
+    //sleep(60);
+
+    /* Graceful shutdown */
+    //ipmgr_stop_log_rotator_thread();
+
+    pthread_exit(NULL);
+    return EXIT_SUCCESS;
 }
-
-#if 1
-int main(int argc, char *argv[]) {
-    // Optional command-line args:
-    // argv[1] = directory, argv[2] = max files, argv[3..] = target files
-    if (argc > 1) {
-        watch_dir = argv[1];
-    }
-    if (argc > 2) {
-        MAX_FILES = atoi(argv[2]);
-    }
-    if (argc > 3) {
-        NUM_TARGET_FILES = argc - 3;
-        target_files = &argv[3];
-    } else {
-        // Default target files
-        static char *default_files[] = {"ipstrc.bak", "pdtrc.bak", "ipmgr.bak", "inttrc.bak"};
-        target_files = default_files;
-    }
-
-    printf("Configuration:\n");
-    printf("Directory: %s\n", watch_dir);
-    printf("Max rotated files: %d\n", MAX_FILES);
-    printf("Target files:\n");
-    for (int i = 0; i < NUM_TARGET_FILES; i++) {
-        printf("  %s\n", target_files[i]);
-    }
-
-    sms_log_rotator_thread_init();
-
-    // Keep main thread alive
-    pthread_exit(0);
-    return 0;
-}
-#endif
