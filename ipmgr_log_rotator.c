@@ -153,10 +153,18 @@ static pthread_spinlock_t rotator_compressor_thread_sync;
 static atomic_bool zip_in_progress = false;
 
 /*
- * Filename passed to zipper thread (e.g., "var/log/ipmgr.log.5")
- * Set by file_rotate() when the highest numbered log file is created.
+ * Per-file-type compression state
+ * Each file type (ipstrc, pdtrc, ipmgr, inttrc) tracks its own terminal_fname
+ * to prevent race conditions where multiple file types trigger compression
+ * simultaneously and overwrite each other's filenames.
  */
-static char terminal_fname[MAX_FILENAME];
+static struct {
+    char terminal_fname[MAX_FILENAME];
+    atomic_bool needs_compression;
+} file_compression_state[DEFAULT_NUM_TARGET_FILES];
+
+/* Spinlock to protect compression state updates */
+static pthread_spinlock_t compression_state_lock;
 
 /* Thread handles */
 static pthread_t zipper_thread;
@@ -196,22 +204,22 @@ get_file_type_index(const char *fname)
 }
 
 /**
- * compress_all_log_files()
+ * compress_all_log_files_with_name()
  * 
  * Purpose:
  *   Compresses all numbered log files (log.1 to log.N) into a single
  *   timestamped tar.gz archive, then deletes the original files.
  *
  * Input:
- *   Reads from global variable 'terminal_fname' which contains the path
- *   to the highest numbered log file (e.g., "var/log/ipmgr.log.5")
+ *   terminal_fname_param: path to the highest numbered log file (e.g., "var/log/ipmgr.log.5")
  *
  * Process:
  *   1. Parse filename to extract base name and maximum index
  *   2. Create timestamped archive name
  *   3. Build tar command to compress all numbered files
  *   4. Execute tar command
- *   5. Delete original files on success
+ *   5. Delete old archive (after new one succeeds)
+ *   6. Delete original files on success
  *
  * Example:
  *   Input:  terminal_fname = "var/log/ipmgr.log.5"
@@ -219,12 +227,12 @@ get_file_type_index(const char *fname)
  *           (contains ipmgr.log.1, ipmgr.log.2, ..., ipmgr.log.5)
  */
 static void 
-compress_all_log_files(void)
+compress_all_log_files_with_name(const char *terminal_fname_param)
 {
     int max_index = 0;
     char base[MAX_FILENAME + 32];   /* Base path without number */
     char fname[MAX_FILENAME];       /* Filename without path */
-    char *name = terminal_fname;
+    const char *name = terminal_fname_param;
 
     printf("%s() : File compression triggered by creation of %s\n", __FUNCTION__, name);
 
@@ -270,21 +278,15 @@ compress_all_log_files(void)
         return;
     }
     
-    /* Delete old archive for THIS specific file type if it exists */
-    if ((control_flags & CTRL_F_DEL_OBSOLETE_TAR_FILES) && 
-            archives[file_idx][0] != '\0' && 
-            access(archives[file_idx], F_OK) == 0) {
-
-        /* Old archive exists, try to remove it */
-        if (remove(archives[file_idx]) == 0) {
-            printf("Obsolete Archive %s Removed\n", archives[file_idx]);
-        } else {
-            printf("Obsolete Archive %s Failed to remove: ", archives[file_idx]);
-            perror("Archive delete failed");
-        }
-    }
-    
+    /* Generate timestamp and new archive name */
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", tm);
+    
+    /* Save old archive name before overwriting */
+    char old_archive[256];
+    strncpy(old_archive, archives[file_idx], sizeof(old_archive));
+    old_archive[sizeof(old_archive) - 1] = '\0';
+    
+    /* Create new archive name */
     snprintf(archives[file_idx], sizeof(archives[file_idx]), "%s%s_%s.tar.gz", 
              DEFAULT_WATCH_DIR, fname, timestamp);
 
@@ -314,7 +316,7 @@ compress_all_log_files(void)
             strcat(cmd, file_only);
             do_archive = true;
         } else {
-            printf("  [✗] Missing: %s\n", fullpath);
+            printf("   Missing: %s\n", fullpath);
         }
     }
 
@@ -324,12 +326,28 @@ compress_all_log_files(void)
         return;
     }
 
+    /* Now delete old archive before creating the new one */
+    if ((control_flags & CTRL_F_DEL_OBSOLETE_TAR_FILES) && 
+            old_archive[0] != '\0' && 
+            access(old_archive, F_OK) == 0) {
+
+        /* Old archive exists, try to remove it */
+        if (remove(old_archive) == 0) {
+            printf("Obsolete Archive %s Removed\n", old_archive);
+        } else {
+            printf("Obsolete Archive %s Failed to remove: ", old_archive);
+            perror("Archive delete failed");
+        }
+    }
+
     /* Execute tar command */
     printf("\n--- Executing TAR Command ---\n%s\n\n", cmd);
     if (system(cmd) != 0) {
         perror("ERROR: tar command failed");
         return;
     }
+
+    printf("\n[SUCCESS] Archive created: %s\n\n", archives[file_idx]);
 
     /* Remove original files after successful archive creation */
     if (control_flags & CTRL_F_DELETE_OBSOLETE_LOG_FILES) {
@@ -370,6 +388,7 @@ static void *
 zip_log_file_thread_fn(void *arg)
 {
     (void)arg;  /* Unused parameter */
+    char local_terminal_fname[MAX_FILENAME];
 
     /* Configure thread cancellation behavior */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -383,6 +402,32 @@ zip_log_file_thread_fn(void *arg)
         /* Wait for compression request (cancellation point) */
         sem_wait(&zipper_thread_sync);
         
+        /* Find which file type needs compression */
+        int file_idx_to_compress = -1;
+        
+        pthread_spin_lock(&compression_state_lock);
+        for (int i = 0; i < DEFAULT_NUM_TARGET_FILES; i++) {
+            if (atomic_load(&file_compression_state[i].needs_compression)) {
+                file_idx_to_compress = i;
+                
+                /* Copy terminal filename to local variable */
+                strncpy(local_terminal_fname, 
+                        file_compression_state[i].terminal_fname,
+                        sizeof(local_terminal_fname));
+                local_terminal_fname[sizeof(local_terminal_fname) - 1] = '\0';
+                
+                /* Clear the flag */
+                atomic_store(&file_compression_state[i].needs_compression, false);
+                break;
+            }
+        }
+        pthread_spin_unlock(&compression_state_lock);
+        
+        if (file_idx_to_compress < 0) {
+            fprintf(stderr, "WARNING: Zipper woke up but no file needs compression\n");
+            continue;
+        }
+        
         /* lock the Critical section. Any operation on numbered files
         is defined as C.S */
         pthread_spin_lock(&rotator_compressor_thread_sync);
@@ -390,8 +435,8 @@ zip_log_file_thread_fn(void *arg)
         /* Set atomic flag to indicate compression in progress */
         atomic_store(&zip_in_progress, true);
         
-        /* Perform compression */
-        compress_all_log_files();
+        /* Perform compression using the local copy */
+        compress_all_log_files_with_name(local_terminal_fname);
         
         /* Clear atomic flag */
         atomic_store(&zip_in_progress, false);
@@ -471,9 +516,20 @@ file_rotate(const char *base_name)
 
     /* Signal zipper thread if maximum files reached */
     if (ready_to_zip) {
-        /* Store filename for zipper thread (e.g., "var/log/ipmgr.log.5") */
-        snprintf(terminal_fname, sizeof(terminal_fname), 
+        /* Determine which file type this is */
+        int file_idx = get_file_type_index(base_name);
+        if (file_idx < 0) {
+            fprintf(stderr, "ERROR: Unknown file type for compression: %s\n", base_name);
+            return;
+        }
+        
+        /* Store filename for zipper thread with lock protection */
+        pthread_spin_lock(&compression_state_lock);
+        snprintf(file_compression_state[file_idx].terminal_fname, 
+                 sizeof(file_compression_state[file_idx].terminal_fname), 
                  "%s.log.%d", base_name, DEFAULT_MAX_FILES);
+        atomic_store(&file_compression_state[file_idx].needs_compression, true);
+        pthread_spin_unlock(&compression_state_lock);
 
         /* Wake up zipper thread to start compression */
         sem_post(&zipper_thread_sync);
@@ -835,6 +891,14 @@ ipmgr_start_log_rotator_thread(void)
     sem_init(&wait_for_thread_init, 0, 0);    /* Zero semaphore for init sync */
     pthread_spin_init(
         &rotator_compressor_thread_sync, PTHREAD_PROCESS_PRIVATE); /* Spinlock for mutual ex*/
+    pthread_spin_init(
+        &compression_state_lock, PTHREAD_PROCESS_PRIVATE); /* Spinlock for compression state */
+    
+    /* Initialize per-file-type compression state */
+    for (int i = 0; i < DEFAULT_NUM_TARGET_FILES; i++) {
+        file_compression_state[i].terminal_fname[0] = '\0';
+        atomic_store(&file_compression_state[i].needs_compression, false);
+    }
 
     printf("\n========================================\n");
     printf("  Log Rotation System Starting\n");
@@ -878,6 +942,7 @@ ipmgr_stop_log_rotator_thread(void)
     /* Clean up resources */
     sem_destroy(&zipper_thread_sync);
     pthread_spin_destroy(&rotator_compressor_thread_sync);
+    pthread_spin_destroy(&compression_state_lock);
     inotify_rm_watch(inotify_fd, watch_fd);
     close(inotify_fd);
 
