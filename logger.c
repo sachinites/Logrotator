@@ -181,7 +181,10 @@ int write_log(FILE **fp, thread_data_t *data, const char *log_message, long *old
 
         // make a new unique .bak each time
         char bak_name[256];
-        snprintf(bak_name, sizeof(bak_name), "%s/%s.bak", LOG_DIR_PATH, data->thread_name);
+        time_t now = time(NULL);
+        
+        snprintf(bak_name, sizeof(bak_name), "%s/%s.%ld.bak", 
+            LOG_DIR_PATH, data->thread_name, now);
 
         rename(data->log_file, bak_name);
 

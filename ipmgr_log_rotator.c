@@ -21,6 +21,19 @@
  *
  ******************************************************************************/
 
+/*
+Design Consideration: 
+
+Goal : Logs need to be rotated and zipped as when they are produced, even at a very high rate. Log Rotator Utility cannot wait/sleep/block
+
+Log Gen could produce logs at higher rate
+File Compression could be slow as compared to file rotation 
+Therefore, File compression is offloaded to separate thread “Compression thread” so that log rotator thread is quickly relieved and go back listen for inotify events 
+But it created back pressure – Log Rotator thread cannot rotate files if File Compressor thread is busy compressing them
+Back pressure is prevented by not making log rotator thread wait for compressor thread to finish. 
+Log rotator thread first checks the status of compressor thread. If the C-thread is busy, log-rotator thread append incoming .bak file logs to pdtrc.log.0 and go back listen to inotify event ( no wait here ) 
+No .bak file should be missed */
+
 #define _POSIX_C_SOURCE 200809L
 
 /* Standard Library Headers */
@@ -46,9 +59,7 @@
 #include <semaphore.h>
 #include <stdatomic.h>
 
-#if 1
-/* Disable all printf/fprintf and perrors 
-    for production build */
+#if 0
 #define printf(...) do { } while (0)
 #define fprintf(...) do { } while (0)
 #define perror(...) do { } while (0)
@@ -121,10 +132,18 @@ static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
  *                     Posted when files are ready to be compressed.
  *                     
  * wait_for_thread_init: Zero semaphore ensuring threads are initialized
- *                       before main thread proceeds.
+ *                       before ipmgr main thread proceed further.
+ * rotator_compressor_thread_sync : To implement mutual exclustion betwen
+ *                       rotator thread and compressor thread. Log files
+ *                       compression and rotation is mutually exclusive.
  */
-static sem_t zipper_thread_sync;
-static sem_t wait_for_thread_init;
+static sem_t zipper_thread_sync; // Zero Sema
+static sem_t wait_for_thread_init; // Zero Sema
+
+/* Spin lock for mutual exclusivity for any operation on logfiles, 
+    since they are shared data being acted upon by Rotator and
+    Compressor thread */
+static pthread_spinlock_t rotator_compressor_thread_sync;
 
 /*
  * Atomic flag indicating compression is in progress.
@@ -364,6 +383,10 @@ zip_log_file_thread_fn(void *arg)
         /* Wait for compression request (cancellation point) */
         sem_wait(&zipper_thread_sync);
         
+        /* lock the Critical section. Any operation on numbered files
+        is defined as C.S */
+        pthread_spin_lock(&rotator_compressor_thread_sync);
+
         /* Set atomic flag to indicate compression in progress */
         atomic_store(&zip_in_progress, true);
         
@@ -372,6 +395,9 @@ zip_log_file_thread_fn(void *arg)
         
         /* Clear atomic flag */
         atomic_store(&zip_in_progress, false);
+        
+        /* Unlock the Critical section. */
+        pthread_spin_unlock(&rotator_compressor_thread_sync);
     }
     
     return NULL;
@@ -629,8 +655,13 @@ handle_bak_file(const char *bak_file)
                 full_bak_path, numbered_file, strerror(errno));
     }
 
+    /* lock the Critical section. Any operation on numbered files
+        is defined as C.S */
+    pthread_spin_lock(&rotator_compressor_thread_sync);
     /* Rotate existing numbered files */
     file_rotate(base_name);
+    /* Unlock the Critical section. */
+    pthread_spin_unlock(&rotator_compressor_thread_sync);
 }
 
 /**
@@ -801,7 +832,9 @@ ipmgr_start_log_rotator_thread(void)
 {
     /* Initialize synchronization primitives */
     sem_init(&zipper_thread_sync, 0, 0);      /* Zero semaphore (starts at 0) */
-    sem_init(&wait_for_thread_init, 0, 0);   /* Zero semaphore for init sync */
+    sem_init(&wait_for_thread_init, 0, 0);    /* Zero semaphore for init sync */
+    pthread_spin_init(
+        &rotator_compressor_thread_sync, PTHREAD_PROCESS_PRIVATE); /* Spinlock for mutual ex*/
 
     printf("\n========================================\n");
     printf("  Log Rotation System Starting\n");
@@ -844,6 +877,7 @@ ipmgr_stop_log_rotator_thread(void)
 
     /* Clean up resources */
     sem_destroy(&zipper_thread_sync);
+    pthread_spin_destroy(&rotator_compressor_thread_sync);
     inotify_rm_watch(inotify_fd, watch_fd);
     close(inotify_fd);
 
