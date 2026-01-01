@@ -1,5 +1,5 @@
 /*******************************************************************************
- * File: monitor.c
+ * File: ipmgr_log_rotator.c
  * 
  * Description:
  *   Log rotation and compression system for managing application log files.
@@ -19,8 +19,6 @@
  *   - ipmgr.bak   -> IP Manager logs
  *   - inttrc.bak  -> Internal Trace logs
  *
- * Author: [Your Name]
- * Date: [Date]
  ******************************************************************************/
 
 #define _POSIX_C_SOURCE 200809L
@@ -32,8 +30,10 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <dirent.h>
 #include <limits.h>
 #include <time.h>
+#include <regex.h>
 
 /* System Headers */
 #include <sys/inotify.h>
@@ -46,14 +46,17 @@
 #include <semaphore.h>
 #include <stdatomic.h>
 
+#if 1
 /* Disable all printf/fprintf and perrors 
     for production build */
 #define printf(...) do { } while (0)
 #define fprintf(...) do { } while (0)
 #define perror(...) do { } while (0)
+#endif 
 
 /*******************************************************************************
- *                          CONFIGURATION DEFINES
+ *  CONFIGURATION DEFINES BEGIN 
+ *  Modify below values to configure this program
  ******************************************************************************/
 
 /* Inotify buffer configuration */
@@ -63,26 +66,53 @@
 
 /* File path configuration */
 #define FILE_ABS_PATH_NAME_LEN  256
+
+/* Customizable parameters*/
 #define DEFAULT_WATCH_DIR       "var/log/"
-
-/* Log rotation configuration */
 #define DEFAULT_MAX_FILES       5  /* Number of rotated log files to keep */
-#define DEFAULT_NUM_TARGET_FILES 4 /* Number of target log file types */
-
-/*******************************************************************************
- *                          GLOBAL VARIABLES
- ******************************************************************************/
 
 /* 
  * Target log files to monitor (without .bak extension)
  * These are the base names that will be matched in inotify events
  */
-const char target_files[][MAX_FILENAME] = {
+static const char target_files[][MAX_FILENAME] = {
     "ipstrc",   /* IP Stack Trace logs */
     "pdtrc",    /* Protocol Data Trace logs */
     "ipmgr",    /* IP Manager logs */
     "inttrc"    /* Internal Trace logs */
 };
+
+/* Specify the number of target files */
+#define DEFAULT_NUM_TARGET_FILES 4
+
+
+/* CONTROL FLAGS BEGIN */
+
+/* Remove obsolete tar files after successful archive creation */
+#define CTRL_F_DEL_OBSOLETE_TAR_FILES 1
+/* Remove original files after successful archive creation */
+#define CTRL_F_DELETE_OBSOLETE_LOG_FILES 2
+
+static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
+                                CTRL_F_DELETE_OBSOLETE_LOG_FILES;
+
+
+/*********************************************************************************
+ *  CONFIGURATION DEFINES ENDs
+ *********************************************************************************/
+ /********************************************************************************/
+ /********************************************************************************/
+
+
+
+
+
+#define TAR_CMD_SIZE_LEN    (DEFAULT_MAX_FILES * FILE_ABS_PATH_NAME_LEN)
+
+
+/*******************************************************************************
+ *                          GLOBAL VARIABLES
+ ******************************************************************************/
 
 /*
  * Thread Synchronization Primitives
@@ -117,9 +147,34 @@ static pthread_t log_rotator_thread;
 static int inotify_fd;  /* inotify instance */
 static int watch_fd;    /* watch descriptor for monitored directory */
 
+
+
+
+
 /*******************************************************************************
  *                      FILE COMPRESSION FUNCTIONS
  ******************************************************************************/
+
+/**
+ * get_file_type_index()
+ * 
+ * Purpose:
+ *   Determines the index of a file type in the target_files array.
+ *   Used to track archives separately for each file type.
+ *
+ * @param fname  Base filename (e.g., "ipstrc.log", "ipmgr.log")
+ * @return Index (0-3) if found, -1 if not found
+ */
+static int
+get_file_type_index(const char *fname)
+{
+    for (int i = 0; i < DEFAULT_NUM_TARGET_FILES; i++) {
+        if (strstr(fname, target_files[i]) != NULL) {
+            return i;
+        }
+    }
+    return -1;  /* Not found */
+}
 
 /**
  * compress_all_log_files()
@@ -149,11 +204,10 @@ compress_all_log_files(void)
 {
     int max_index = 0;
     char base[MAX_FILENAME + 32];   /* Base path without number */
-    char dir[MAX_FILENAME + 32];    /* Directory path */
     char fname[MAX_FILENAME];       /* Filename without path */
     char *name = terminal_fname;
 
-    printf("%s() called....\n", __FUNCTION__);
+    printf("%s() : File compression triggered by creation of %s\n", __FUNCTION__, name);
 
     /*
      * Parse the file number from the end of the filename
@@ -170,29 +224,50 @@ compress_all_log_files(void)
     strncpy(base, name, len);
     base[len] = '\0';
 
-    /* Split into directory and filename components */
+    /* extract filename from the path */
     char *slash = strrchr(base, '/');
     if (slash) {
-        size_t dlen = slash - base;
-        strncpy(dir, base, dlen);
-        dir[dlen] = '\0';
         strcpy(fname, slash + 1);
     } else {
-        strcpy(dir, ".");
         strcpy(fname, base);
     }
 
     /*
      * Generate timestamp for archive name
      * Format: YYYY-MM-DD_HH-MM-SS
+     * 
+     * Store archives separately for each file type (ipstrc, pdtrc, ipmgr, inttrc)
+     * Array size is 4 to match the 4 target file types
      */
-    char archive[256];
+    static char archives[DEFAULT_NUM_TARGET_FILES][256] = {{0}};
     char timestamp[64];
     time_t now = time(NULL);
     struct tm *tm = localtime(&now);
     
+    /* Determine which file type we're compressing */
+    int file_idx = get_file_type_index(fname);
+    if (file_idx < 0) {
+        fprintf(stderr, "ERROR: Unknown file type: %s\n", fname);
+        return;
+    }
+    
+    /* Delete old archive for THIS specific file type if it exists */
+    if ((control_flags & CTRL_F_DEL_OBSOLETE_TAR_FILES) && 
+            archives[file_idx][0] != '\0' && 
+            access(archives[file_idx], F_OK) == 0) {
+
+        /* Old archive exists, try to remove it */
+        if (remove(archives[file_idx]) == 0) {
+            printf("Obsolete Archive %s Removed\n", archives[file_idx]);
+        } else {
+            printf("Obsolete Archive %s Failed to remove: ", archives[file_idx]);
+            perror("Archive delete failed");
+        }
+    }
+    
     strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", tm);
-    snprintf(archive, sizeof(archive), "%s/%s_%s.tar.gz", dir, fname, timestamp);
+    snprintf(archives[file_idx], sizeof(archives[file_idx]), "%s%s_%s.tar.gz", 
+             DEFAULT_WATCH_DIR, fname, timestamp);
 
     /*
      * Build tar command
@@ -201,18 +276,18 @@ compress_all_log_files(void)
      * -f: output filename
      * -C: change to directory (so archive contains only filenames, not full paths)
      */
-    char cmd[2048];
-    char file_only[128];
-    char fullpath[256];
+    char cmd[TAR_CMD_SIZE_LEN];
+    char file_only[MAX_FILENAME * 2];
+    char fullpath[FILE_ABS_PATH_NAME_LEN];
     bool do_archive = false;
 
-    snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\"", archive, dir);
+    snprintf(cmd, sizeof(cmd), "tar -czf \"%s\" -C \"%s\"", archives[file_idx], DEFAULT_WATCH_DIR);
 
     /* Iterate through all numbered files and add them to the tar command */
     printf("\n--- Collecting Files for Archive ---\n");
     for (int i = 1; i <= max_index; i++) {
         snprintf(file_only, sizeof(file_only), "%s.%d", fname, i);
-        snprintf(fullpath, sizeof(fullpath), "%s/%s.%d", dir, fname, i);
+        snprintf(fullpath, sizeof(fullpath), "%s%s.%d", DEFAULT_WATCH_DIR, fname, i);
 
         if (access(fullpath, F_OK) == 0) {
             printf("   Found: %s\n", fullpath);
@@ -238,19 +313,24 @@ compress_all_log_files(void)
     }
 
     /* Remove original files after successful archive creation */
-    printf("--- Cleaning Up Original Files ---\n");
-    for (int i = 1; i <= max_index; i++) {
-        char rm[256];
-        snprintf(rm, sizeof(rm), "%s/%s.%d", dir, fname, i);
-        
-        if (remove(rm) == 0) {
-            printf("   Deleted: %s\n", rm);
-        } else {
-            perror(rm);
+    if (control_flags & CTRL_F_DELETE_OBSOLETE_LOG_FILES) {
+
+        printf("--- Cleaning Up Original Files ---\n");
+
+        for (int i = 1; i <= max_index; i++) {
+
+            char rm[256];
+            snprintf(rm, sizeof(rm), "%s%s.%d", DEFAULT_WATCH_DIR, fname, i);
+            
+            if (remove(rm) == 0) {
+                printf("   Deleted: %s\n", rm);
+            } else {
+                perror(rm);
+            }
         }
     }
 
-    printf("\n[SUCCESS] Archive created: %s\n\n", archive);
+    printf("\n[SUCCESS] Archive created: %s\n\n", archives[file_idx]);
 }
 
 /**
