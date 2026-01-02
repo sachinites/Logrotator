@@ -14,6 +14,9 @@
  *   - Thread-safe operation with semaphores and atomic variables
  *
  * Managed Files:
+ *   - Any logger which generate .bak file in /var/log ( customizable ) dir can
+ *     be managed by this utlity program.
+ * 
  *   - ipstrc.bak  -> IP Stack Trace logs
  *   - pdtrc.bak   -> Protocol Data Trace logs
  *   - ipmgr.bak   -> IP Manager logs
@@ -31,7 +34,8 @@ File Compression could be slow as compared to file rotation
 Therefore, File compression is offloaded to separate thread “Compression thread” so that log rotator thread is quickly relieved and go back listen for inotify events 
 But it created back pressure – Log Rotator thread cannot rotate files if File Compressor thread is busy compressing them
 Back pressure is prevented by not making log rotator thread wait for compressor thread to finish. 
-Log rotator thread first checks the status of compressor thread. If the C-thread is busy, log-rotator thread append incoming .bak file logs to pdtrc.log.0 and go back listen to inotify event ( no wait here ) 
+Log rotator thread first checks the status of compressor thread. If the C-thread is busy, log-rotator thread append 
+    incoming .bak file logs to pdtrc.log.0 and go back listen to inotify event ( no wait here ) 
 No .bak file should be missed */
 
 #define _POSIX_C_SOURCE 200809L
@@ -59,7 +63,7 @@ No .bak file should be missed */
 #include <semaphore.h>
 #include <stdatomic.h>
 
-#if 0
+#if 1
 #define printf(...) do { } while (0)
 #define fprintf(...) do { } while (0)
 #define perror(...) do { } while (0)
@@ -79,8 +83,8 @@ No .bak file should be missed */
 #define FILE_ABS_PATH_NAME_LEN  256
 
 /* Customizable parameters*/
-#define DEFAULT_WATCH_DIR       "var/log/"
-#define DEFAULT_MAX_FILES       5  /* Number of rotated log files to keep */
+#define DEFAULT_WATCH_DIR       "/var/log/"
+#define DEFAULT_MAX_FILES       15  /* Number of rotated log files to keep */
 
 /* 
  * Target log files to monitor (without .bak extension)
@@ -89,12 +93,11 @@ No .bak file should be missed */
 static const char target_files[][MAX_FILENAME] = {
     "ipstrc",   /* IP Stack Trace logs */
     "pdtrc",    /* Protocol Data Trace logs */
-    "ipmgr",    /* IP Manager logs */
     "inttrc"    /* Internal Trace logs */
 };
 
 /* Specify the number of target files */
-#define DEFAULT_NUM_TARGET_FILES 4
+#define DEFAULT_NUM_TARGET_FILES 3
 
 
 /* CONTROL FLAGS BEGIN */
@@ -115,9 +118,6 @@ static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
  /********************************************************************************/
 
 
-
-
-
 #define TAR_CMD_SIZE_LEN    (DEFAULT_MAX_FILES * FILE_ABS_PATH_NAME_LEN)
 
 
@@ -128,7 +128,7 @@ static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
 /*
  * Thread Synchronization Primitives
  * ----------------------------------
- * zipper_thread_sync: Zero semaphore controlling access to zipper thread.
+ * wake_up_zipper_thread: Zero semaphore controlling access to zipper thread.
  *                     Posted when files are ready to be compressed.
  *                     
  * wait_for_thread_init: Zero semaphore ensuring threads are initialized
@@ -137,9 +137,15 @@ static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
  *                       rotator thread and compressor thread. Log files
  *                       compression and rotation is mutually exclusive.
  */
-static sem_t zipper_thread_sync; // Zero Sema
-static sem_t wait_for_thread_init; // Zero Sema
-static sem_t inotify_events_allow_sema; // Zero Sema
+/* Semaphore to wake up Zipper thread when files to be compressed
+    are ready */
+static sem_t wake_up_zipper_thread;
+
+/* Semaphore to wait until the new thread is initialized */
+static sem_t wait_for_thread_init;
+
+/* Semaphore to momentarily block inotify events */
+static sem_t inotify_events_allow_sema;
 
 /* Spin lock for mutual exclusivity for any operation on logfiles, 
     since they are shared data being acted upon by Rotator and
@@ -185,8 +191,9 @@ file_rotate(const char *base_name);
 
 
 /*******************************************************************************
- *                      FILE COMPRESSION FUNCTIONS
+ *                     HELPER FUNCTIONS
  ******************************************************************************/
+
 
 /**
  * get_file_type_index()
@@ -266,7 +273,7 @@ rename_all_log0_to_log1_log_file() {
         snprintf(log0_fname, sizeof(log0_fname), "%s%s.log.0",
                  DEFAULT_WATCH_DIR, target_files[i]);
 
-        if (access(log0_fname, F_OK)) return;
+        if (access(log0_fname, F_OK)) continue;
 
         snprintf(log1_fname, sizeof(log1_fname), "%s%s.log.1",
                  DEFAULT_WATCH_DIR, target_files[i]);
@@ -281,6 +288,9 @@ rename_all_log0_to_log1_log_file() {
     }
 }
 
+/*******************************************************************************
+ *                      FILE COMPRESSION FUNCTIONS
+ ******************************************************************************/
 
 /**
  * compress_all_log_files_with_name()
@@ -454,7 +464,7 @@ compress_all_log_files_with_name(const char *terminal_fname_param)
  * 
  * Purpose:
  *   Worker thread that waits for compression requests and processes them.
- *   Runs in an infinite loop waiting on the zipper_thread_sync semaphore.
+ *   Runs in an infinite loop waiting on the wake_up_zipper_thread semaphore.
  *
  * Thread Safety:
  *   - Uses atomic operations to set/clear zip_in_progress flag
@@ -480,7 +490,7 @@ zip_log_file_thread_fn(void *arg)
     /* Main work loop */
     while (1) {
         /* Wait for compression request (cancellation point) */
-        sem_wait(&zipper_thread_sync);
+        sem_wait(&wake_up_zipper_thread);
         
         /* Find which file type needs compression */
         int file_idx_to_compress = -1;
@@ -633,7 +643,7 @@ file_rotate(const char *base_name)
         pthread_spin_unlock(&compression_state_lock);
 
         /* Wake up zipper thread to start compression */
-        sem_post(&zipper_thread_sync);
+        sem_post(&wake_up_zipper_thread);
         ready_to_zip = false;
     }
 }
@@ -1005,7 +1015,7 @@ void
 ipmgr_start_log_rotator_thread(void)
 {
     /* Initialize synchronization primitives */
-    sem_init(&zipper_thread_sync, 0, 0);      /* Zero semaphore (starts at 0) */
+    sem_init(&wake_up_zipper_thread, 0, 0);      /* Zero semaphore (starts at 0) */
     sem_init(&wait_for_thread_init, 0, 0);    /* Zero semaphore for init sync */
     sem_init(&inotify_events_allow_sema, 0,1); /* Binary semaphore to momentarily 
                                                     pause inotify events*/
@@ -1060,7 +1070,7 @@ ipmgr_stop_log_rotator_thread(void)
     printf(" Zipper thread stopped\n");
 
     /* Clean up resources */
-    sem_destroy(&zipper_thread_sync);
+    sem_destroy(&wake_up_zipper_thread);
     sem_destroy(&inotify_events_allow_sema);
 
     pthread_spin_destroy(&operations_on_log_files);
