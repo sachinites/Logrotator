@@ -133,17 +133,18 @@ static uint16_t control_flags = CTRL_F_DEL_OBSOLETE_TAR_FILES | \
  *                     
  * wait_for_thread_init: Zero semaphore ensuring threads are initialized
  *                       before ipmgr main thread proceed further.
- * rotator_compressor_thread_sync : To implement mutual exclustion betwen
+ * operations_on_log_files : To implement mutual exclustion betwen
  *                       rotator thread and compressor thread. Log files
  *                       compression and rotation is mutually exclusive.
  */
 static sem_t zipper_thread_sync; // Zero Sema
 static sem_t wait_for_thread_init; // Zero Sema
+static sem_t inotify_events_allow_sema; // Zero Sema
 
 /* Spin lock for mutual exclusivity for any operation on logfiles, 
     since they are shared data being acted upon by Rotator and
     Compressor thread */
-static pthread_spinlock_t rotator_compressor_thread_sync;
+static pthread_spinlock_t operations_on_log_files;
 
 /*
  * Atomic flag indicating compression is in progress.
@@ -174,7 +175,12 @@ static pthread_t log_rotator_thread;
 static int inotify_fd;  /* inotify instance */
 static int watch_fd;    /* watch descriptor for monitored directory */
 
+/*******************************************************************************
+ *                      FUNCTION DECLARATION
+ ******************************************************************************/
 
+void 
+file_rotate(const char *base_name);
 
 
 
@@ -202,6 +208,79 @@ get_file_type_index(const char *fname)
     }
     return -1;  /* Not found */
 }
+
+static void
+generate_dummy_inotify_bak_event()
+{
+    int i;
+    char cmd[512];
+    char dummy_bak_fname[FILE_ABS_PATH_NAME_LEN];
+
+    for (i = 0; i < DEFAULT_NUM_TARGET_FILES; i++)
+    {
+        snprintf(dummy_bak_fname, sizeof(dummy_bak_fname), 
+            "%s%s.dummy.bak", DEFAULT_WATCH_DIR, target_files[i]);
+
+        snprintf(cmd, sizeof(cmd), "touch %s", dummy_bak_fname);
+
+        printf("\n--- Executing dummy bak file creation cmd ---\n%s\n\n", cmd);
+        if (system(cmd) != 0) {
+            perror("ERROR: dummy bak file creation command failed");
+        }
+    }
+}
+
+/* if *.log.0 exist 
+     then trigger file rotate
+   else no-op 
+*/
+static void 
+handle_dummy_bak_file_creation(int findex) {
+
+    char base_fname[FILE_ABS_PATH_NAME_LEN];
+    char log0_fname[FILE_ABS_PATH_NAME_LEN];
+
+    snprintf (log0_fname, sizeof (log0_fname), "%s%s.log.0", 
+        DEFAULT_WATCH_DIR, target_files[findex]);
+
+    if (access (log0_fname, F_OK)) return;
+
+    pthread_spin_lock(&operations_on_log_files);
+
+    snprintf (base_fname, sizeof(base_fname), "%s%s",
+        DEFAULT_WATCH_DIR, target_files[findex]);
+    /* Rotate existing numbered files */
+    file_rotate(base_fname);
+    /* Unlock the Critical section. */
+    pthread_spin_unlock(&operations_on_log_files);    
+}
+
+static void
+rename_all_log0_to_log1_log_file() {
+
+    char log0_fname[FILE_ABS_PATH_NAME_LEN];
+    char log1_fname[FILE_ABS_PATH_NAME_LEN];
+
+    for (int i = 0; i < DEFAULT_NUM_TARGET_FILES; i++)
+    {
+        snprintf(log0_fname, sizeof(log0_fname), "%s%s.log.0",
+                 DEFAULT_WATCH_DIR, target_files[i]);
+
+        if (access(log0_fname, F_OK)) return;
+
+        snprintf(log1_fname, sizeof(log1_fname), "%s%s.log.1",
+                 DEFAULT_WATCH_DIR, target_files[i]);
+
+        if (rename(log0_fname, log1_fname) == 0) {
+            printf("   %s(): Renamed: %s -> %s\n", __FUNCTION__, log0_fname, log1_fname);
+        }
+        else {
+            fprintf(stderr, "%s(): ERROR: Rename failed: %s -> %s: %s\n",
+                    __FUNCTION__, log0_fname, log1_fname, strerror(errno));
+        }
+    }
+}
+
 
 /**
  * compress_all_log_files_with_name()
@@ -389,6 +468,7 @@ zip_log_file_thread_fn(void *arg)
 {
     (void)arg;  /* Unused parameter */
     char local_terminal_fname[MAX_FILENAME];
+    char log0_fname[FILE_ABS_PATH_NAME_LEN];
 
     /* Configure thread cancellation behavior */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
@@ -430,19 +510,40 @@ zip_log_file_thread_fn(void *arg)
         
         /* lock the Critical section. Any operation on numbered files
         is defined as C.S */
-        pthread_spin_lock(&rotator_compressor_thread_sync);
+        pthread_spin_lock(&operations_on_log_files);
 
         /* Set atomic flag to indicate compression in progress */
         atomic_store(&zip_in_progress, true);
         
         /* Perform compression using the local copy */
         compress_all_log_files_with_name(local_terminal_fname);
+
+        #if 0
+        /* Generate dummy bak log file to handle .log.0 file created
+            while the zipper thread was busy compressing logs. This will generate 
+            inotify event which guide log rotator thread to perform one more log 
+            rotation to rename .log.0 file to .log.1 through file rotation. IF we dont
+            do this, user may see ipstrc.log.0 file in /var/log dir which would persists
+            until next .bak create event. ipstrc.log.0 is transient file and must not
+            exist persistently. We use dummy event to avoid extra thread sync headache.
+            Here, zipper thread is signaling the log rotator thread indirectly. */
+
+            generate_dummy_inotify_bak_event ();
+
+        #else
+            
+            /* Alternate Approach : seems better than above approach */
+            sem_wait(&inotify_events_allow_sema);
+            rename_all_log0_to_log1_log_file();
+            sem_post(&inotify_events_allow_sema);
         
+        #endif 
+
         /* Clear atomic flag */
         atomic_store(&zip_in_progress, false);
         
         /* Unlock the Critical section. */
-        pthread_spin_unlock(&rotator_compressor_thread_sync);
+        pthread_spin_unlock(&operations_on_log_files);
     }
     
     return NULL;
@@ -588,7 +689,7 @@ base_file_name_extract(char *base_name)
  * @param bak_file  Filename of the .bak file (e.g., "ipmgr.log.1234567890.bak")
  */
 void 
-handle_bak_file(const char *bak_file)
+handle_bak_file(const char *bak_file, int findex)
 {
     char full_bak_path[FILE_ABS_PATH_NAME_LEN];
     char numbered_file[512];
@@ -597,10 +698,22 @@ handle_bak_file(const char *bak_file)
     /* Build absolute path to .bak file */
     snprintf(full_bak_path, sizeof(full_bak_path), 
              "%s%s", DEFAULT_WATCH_DIR, bak_file);
+    
+    printf ("%s called to handle : %s\n", __FUNCTION__, full_bak_path);
 
     /* Verify the .bak file exists before processing */
     if (access(full_bak_path, F_OK) != 0) {
         fprintf(stderr, "ERROR: File not found: %s\n", full_bak_path);
+        return;
+    }
+
+    if (strstr (full_bak_path, "dummy")) {
+
+        handle_dummy_bak_file_creation(findex);
+
+        if (remove (full_bak_path) != 0) {
+            fprintf (stderr, "Error : Deletion of dummy bak file %s failed\n", full_bak_path);
+        }
         return;
     }
 
@@ -713,11 +826,11 @@ handle_bak_file(const char *bak_file)
 
     /* lock the Critical section. Any operation on numbered files
         is defined as C.S */
-    pthread_spin_lock(&rotator_compressor_thread_sync);
+    pthread_spin_lock(&operations_on_log_files);
     /* Rotate existing numbered files */
     file_rotate(base_name);
     /* Unlock the Critical section. */
-    pthread_spin_unlock(&rotator_compressor_thread_sync);
+    pthread_spin_unlock(&operations_on_log_files);
 }
 
 /**
@@ -794,18 +907,23 @@ log_rotate_thread_fn(void *arg)
             /* Only process events with a filename */
             if (event->len > 0) {
                 /* Check if this is a .bak file */
-                if (strstr(event->name, ".bak") != NULL) {
-                    printf("\n[inotify] .bak file detected: %s\n", event->name);
+                    if (strstr(event->name, ".bak") == NULL ) {
+                        i += EVENT_SIZE + event->len;
+                        continue;
+                    }
 
+                    printf("\n[inotify] event detected: %s\n", event->name);
                     /* Check if it matches one of our target log types */
+                    
                     for (int j = 0; j < DEFAULT_NUM_TARGET_FILES; j++) {
                         if (strstr(event->name, target_files[j])) {
                             printf("[inotify] Matches target: %s\n", target_files[j]);
-                            handle_bak_file(event->name);
+                            sem_wait(&inotify_events_allow_sema);
+                            handle_bak_file(event->name, j);
+                            sem_post(&inotify_events_allow_sema);
                             break;
                         }
                     }
-                }
             }
 
             /* Move to next event */
@@ -889,8 +1007,10 @@ ipmgr_start_log_rotator_thread(void)
     /* Initialize synchronization primitives */
     sem_init(&zipper_thread_sync, 0, 0);      /* Zero semaphore (starts at 0) */
     sem_init(&wait_for_thread_init, 0, 0);    /* Zero semaphore for init sync */
+    sem_init(&inotify_events_allow_sema, 0,1); /* Binary semaphore to momentarily 
+                                                    pause inotify events*/
     pthread_spin_init(
-        &rotator_compressor_thread_sync, PTHREAD_PROCESS_PRIVATE); /* Spinlock for mutual ex*/
+        &operations_on_log_files, PTHREAD_PROCESS_PRIVATE); /* Spinlock for mutual ex*/
     pthread_spin_init(
         &compression_state_lock, PTHREAD_PROCESS_PRIVATE); /* Spinlock for compression state */
     
@@ -941,7 +1061,9 @@ ipmgr_stop_log_rotator_thread(void)
 
     /* Clean up resources */
     sem_destroy(&zipper_thread_sync);
-    pthread_spin_destroy(&rotator_compressor_thread_sync);
+    sem_destroy(&inotify_events_allow_sema);
+
+    pthread_spin_destroy(&operations_on_log_files);
     pthread_spin_destroy(&compression_state_lock);
     inotify_rm_watch(inotify_fd, watch_fd);
     close(inotify_fd);
