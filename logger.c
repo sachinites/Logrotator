@@ -14,7 +14,7 @@
 #define LOG_FILE_2 "var/log/pdtrc.log"
 #define LOG_FILE_3 "var/log/ipmgr.log"
 #define LOG_FILE_4 "var/log/inttrc.log"
-#define MAX_LOG_SIZE 10240  // 10KB in bytes
+#define MAX_LOG_SIZE 102400  // 100KB in bytes
 #define NUM_THREADS 4
 #define LOG_DIR_PATH "var/log"
 
@@ -131,6 +131,7 @@ void generate_pdtrc_log(char *buffer, size_t size) {
 
 // Generate a random log message for ipmgr
 void generate_ipmgr_log(char *buffer, size_t size) {
+
     char timestamp[64];
     get_timestamp(timestamp, sizeof(timestamp));
     
@@ -265,7 +266,7 @@ void *logger_thread(void *arg) {
         // Very short sleep for high stress - ~1000 logs per second per thread
         // Adjust this value to control stress level:
         // 1000 = ~1000 logs/sec, 10000 = ~100 logs/sec, 100000 = ~10 logs/sec
-        usleep(1000);
+        usleep(10000);
         
         // Use thread-local random
         rand_r(&seed);
@@ -336,6 +337,10 @@ int main(int argc, char *argv[]) {
     // Create threads
     printf("Creating threads...\n");
     for (int i = 0; i < NUM_THREADS; i++) {
+        
+        // Disable all threads except pdtrc
+        //if (thread_data[i].thread_id != 1) continue;
+
         int result = pthread_create(&threads[i], NULL, logger_thread, &thread_data[i]);
         if (result != 0) {
             fprintf(stderr, "Error creating thread %d: %s\n", i, strerror(result));
@@ -348,6 +353,7 @@ int main(int argc, char *argv[]) {
     
     // Wait for all threads (will run indefinitely until Ctrl+C)
     for (int i = 0; i < NUM_THREADS; i++) {
+        //if (thread_data[i].thread_id != 1) continue;
         pthread_join(threads[i], NULL);
     }
     
